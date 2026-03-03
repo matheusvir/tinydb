@@ -21,6 +21,7 @@ from typing import (
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
+from .index import BTreeIndex
 
 __all__ = ('Document', 'Table')
 
@@ -114,6 +115,7 @@ class Table:
             = self.query_cache_class(capacity=cache_size)
 
         self._next_id = None
+        self._indices: Dict[str, BTreeIndex] = {}
         if persist_empty:
             self._update_table(lambda table: table.clear())
 
@@ -139,6 +141,26 @@ class Table:
         Get the table storage instance.
         """
         return self._storage
+
+    def create_index(self, field: str, order: int = 50) -> None:
+        """
+        Create a B-Tree index for the given field.
+
+        This builds the index by scanning all existing documents and then
+        keeps it synchronized on every insert, update, and remove operation.
+        Only simple top-level fields are supported.
+
+        :param field: the document field to index
+        :param order: the B-Tree order (higher = wider nodes, fewer levels)
+        """
+        index = BTreeIndex(order=order)
+
+        # Populate the index with existing documents
+        for doc_id, doc in self._read_table().items():
+            if field in doc:
+                index.insert(doc[field], self.document_id_class(doc_id))
+
+        self._indices[field] = index
 
     def insert(self, document: Mapping) -> int:
         """
@@ -177,6 +199,12 @@ class Table:
 
         # See below for details on ``Table._update``
         self._update_table(updater)
+
+        # Update all indices with the new document
+        doc_dict = dict(document)
+        for field, index in self._indices.items():
+            if field in doc_dict:
+                index.insert(doc_dict[field], doc_id)
 
         return doc_id
 
@@ -222,6 +250,16 @@ class Table:
         # See below for details on ``Table._update``
         self._update_table(updater)
 
+        # Update all indices with the newly inserted documents
+        if self._indices:
+            table_data = self._read_table()
+            for did in doc_ids:
+                raw = table_data.get(str(did))
+                if raw is not None:
+                    for field, index in self._indices.items():
+                        if field in raw:
+                            index.insert(raw[field], did)
+
         return doc_ids
 
     def all(self) -> List[Document]:
@@ -238,6 +276,54 @@ class Table:
 
         return list(iter(self))
 
+    def _try_index_search(
+        self, cond: QueryLike
+    ) -> Optional[List[Document]]:
+        """
+        Attempt to resolve a query using a B-Tree index.
+
+        Returns a list of matching documents if the query is a simple
+        equality check (``Query().field == value``) on an indexed field.
+        Returns ``None`` if the index cannot be used for this query,
+        signalling that the caller should fall back to a full scan.
+
+        .. note:: This optimization relies on the ``_hash`` property of the
+                  query object to identify equality comparisons. Custom query
+                  objects that do not provide a compatible ``_hash`` tuple
+                  will not benefit from index-based lookups.
+        """
+        # The hash of an equality query looks like:
+        #   ('==', (field_name,), frozen_value)
+        hashval = getattr(cond, '_hash', None)
+        if not (isinstance(hashval, tuple)
+                and len(hashval) == 3
+                and hashval[0] == '=='):
+            return None
+
+        path = hashval[1]
+        # Only single-level field paths are indexable
+        if not (isinstance(path, tuple) and len(path) == 1
+                and isinstance(path[0], str)):
+            return None
+
+        field = path[0]
+        if field not in self._indices:
+            return None
+
+        value = hashval[2]
+        doc_ids = self._indices[field].search(value)
+
+        if not doc_ids:
+            return []
+
+        # Fetch the matching documents from storage
+        table = self._read_table()
+        return [
+            self.document_class(table[str(did)], self.document_id_class(did))
+            for did in doc_ids
+            if str(did) in table
+        ]
+
     def search(self, cond: QueryLike) -> List[Document]:
         """
         Search for all documents matching a 'where' cond.
@@ -252,14 +338,19 @@ class Table:
         if cached_results is not None:
             return cached_results[:]
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
-            if cond(doc)
-        ]
+        # Try to use a B-Tree index for O(log n) lookup
+        indexed_result = self._try_index_search(cond)
+        if indexed_result is not None:
+            docs = indexed_result
+        else:
+            # Fallback: full scan — apply the query to all documents.
+            # Then, only if the document matches the query, convert it
+            # to the document class and document ID class.
+            docs = [
+                self.document_class(doc, self.document_id_class(doc_id))
+                for doc_id, doc in self._read_table().items()
+                if cond(doc)
+            ]
 
         # Only cache cacheable queries.
         #
@@ -426,13 +517,49 @@ class Table:
         # Define the function that will perform the update
         if callable(fields):
             def perform_update(table, doc_id):
+                # Capture old values for indexed fields before the update
+                if self._indices:
+                    old_vals = {
+                        f: table[doc_id].get(f)
+                        for f in self._indices if f in table[doc_id]
+                    }
                 # Update documents by calling the update function provided by
                 # the user
                 fields(table[doc_id])
+                # Sync indices with new values
+                if self._indices:
+                    for f, idx in self._indices.items():
+                        new_val = table[doc_id].get(f)
+                        old_val = old_vals.get(f)
+                        if old_val is not None and new_val is not None:
+                            if old_val != new_val:
+                                idx.update(old_val, new_val, doc_id)
+                        elif old_val is not None:
+                            idx.delete(old_val, doc_id)
+                        elif new_val is not None:
+                            idx.insert(new_val, doc_id)
         else:
             def perform_update(table, doc_id):
+                # Capture old values for indexed fields before the update
+                if self._indices:
+                    old_vals = {
+                        f: table[doc_id].get(f)
+                        for f in self._indices if f in table[doc_id]
+                    }
                 # Update documents by setting all fields from the provided data
                 table[doc_id].update(fields)
+                # Sync indices with new values
+                if self._indices:
+                    for f, idx in self._indices.items():
+                        new_val = table[doc_id].get(f)
+                        old_val = old_vals.get(f)
+                        if old_val is not None and new_val is not None:
+                            if old_val != new_val:
+                                idx.update(old_val, new_val, doc_id)
+                        elif old_val is not None:
+                            idx.delete(old_val, doc_id)
+                        elif new_val is not None:
+                            idx.insert(new_val, doc_id)
 
         if doc_ids is not None:
             # Perform the update operation for documents specified by a list
@@ -512,6 +639,13 @@ class Table:
 
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
+            # Capture old values for indexed fields before the update
+            if self._indices:
+                old_vals = {
+                    f: table[doc_id].get(f)
+                    for f in self._indices if f in table[doc_id]
+                }
+
             if callable(fields):
                 # Update documents by calling the update function provided
                 # by the user
@@ -520,6 +654,19 @@ class Table:
                 # Update documents by setting all fields from the provided
                 # data
                 table[doc_id].update(fields)
+
+            # Sync indices with new values
+            if self._indices:
+                for f, idx in self._indices.items():
+                    new_val = table[doc_id].get(f)
+                    old_val = old_vals.get(f)
+                    if old_val is not None and new_val is not None:
+                        if old_val != new_val:
+                            idx.update(old_val, new_val, doc_id)
+                    elif old_val is not None:
+                        idx.delete(old_val, doc_id)
+                    elif new_val is not None:
+                        idx.insert(new_val, doc_id)
 
         # Perform the update operation for documents specified by a query
 
@@ -613,6 +760,15 @@ class Table:
             # to return the list of affected document IDs
             removed_ids = list(doc_ids)
 
+            # Capture indexed values before removal
+            removed_docs: Dict[int, Mapping] = {}
+            if self._indices:
+                table_snapshot = self._read_table()
+                for did in removed_ids:
+                    raw = table_snapshot.get(str(did))
+                    if raw is not None:
+                        removed_docs[did] = raw
+
             def updater(table: dict):
                 for doc_id in removed_ids:
                     table.pop(doc_id)
@@ -620,10 +776,19 @@ class Table:
             # Perform the remove operation
             self._update_table(updater)
 
+            # Update indices
+            for did, raw in removed_docs.items():
+                for field, index in self._indices.items():
+                    if field in raw:
+                        index.delete(raw[field], did)
+
             return removed_ids
 
         if cond is not None:
             removed_ids = []
+
+            # Capture indexed values before removal
+            removed_docs_: Dict[int, Mapping] = {}
 
             # This updater function will be called with the table data
             # as its first argument. See ``Table._update`` for details on this
@@ -644,11 +809,21 @@ class Table:
                         # Add document ID to list of removed document IDs
                         removed_ids.append(doc_id)
 
+                        # Capture document for index cleanup
+                        if self._indices:
+                            removed_docs_[doc_id] = dict(table[doc_id])
+
                         # Remove document from the table
                         table.pop(doc_id)
 
             # Perform the remove operation
             self._update_table(updater)
+
+            # Update indices
+            for did, raw in removed_docs_.items():
+                for field, index in self._indices.items():
+                    if field in raw:
+                        index.delete(raw[field], did)
 
             return removed_ids
 
@@ -664,6 +839,10 @@ class Table:
 
         # Reset document ID counter
         self._next_id = None
+
+        # Clear all indices
+        for index in self._indices.values():
+            index.clear()
 
     def count(self, cond: QueryLike) -> int:
         """
