@@ -369,16 +369,21 @@ class Table:
 
         :returns: the document(s) or ``None``
         """
-        table = self._read_table()
 
         if doc_id is not None:
-            # Fast path: use the Bloom Filter to discard nonexistent IDs.
-            # The filter is lazily initialized by _read_table() above,
-            # so it is guaranteed to be ready at this point.
+            # Fast path: use the Bloom Filter to discard nonexistent IDs
+            # *before* any storage I/O.  When the filter is already
+            # initialized (i.e. after the first _read_table() call) this
+            # avoids the overhead of reading and parsing the storage file
+            # for IDs that are definitely absent.
             if (self._bloom is not None
                     and self._bloom_initialized
                     and not self._bloom.test(str(doc_id))):
                 return None
+
+            # The ID might exist (or the filter is not yet initialised).
+            # We need the actual table data from storage.
+            table = self._read_table()
 
             # Retrieve a document specified by its ID
             raw_doc = table.get(str(doc_id), None)
@@ -390,6 +395,8 @@ class Table:
             return self.document_class(raw_doc, doc_id)
 
         elif doc_ids is not None:
+            table = self._read_table()
+
             # Filter the table by extracting out all those documents which
             # have doc id specified in the doc_id list.
 
