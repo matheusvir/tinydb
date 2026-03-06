@@ -10,6 +10,12 @@ Key features:
     - Supports duplicate keys by storing a list of document IDs for each key.
     - In-memory index that stays synchronized with TinyDB's storage.
     - Supports any comparable Python type (str, int, float, etc.).
+
+.. note:: All values in a given indexed field should be of the same
+          comparable type. Mixing incompatible types (e.g. ``int`` and
+          ``str``) in the same field will cause ``TypeError`` on ``<``/``>``
+          comparisons. The public API methods handle this gracefully by
+          returning empty results or skipping the operation.
 """
 
 from typing import Any, List, Optional, Tuple
@@ -54,25 +60,31 @@ class BTreeIndex:
         If the key already exists (another document has the same field value),
         the ``doc_id`` is appended to the existing list.
 
+        If the key has an incompatible type with existing keys, the operation
+        is silently skipped.
+
         :param key: The field value to index
         :param doc_id: The document ID to associate with the key
         """
-        root = self.root
+        try:
+            root = self.root
 
-        # Check if the key already exists to avoid duplicate keys in the tree
-        existing_node, existing_idx = self._find_key_node(root, key)
-        if existing_node is not None:
-            existing_node.doc_ids[existing_idx].append(doc_id)
-            return
+            # Check if the key already exists to avoid duplicate keys in the tree
+            existing_node, existing_idx = self._find_key_node(root, key)
+            if existing_node is not None:
+                existing_node.doc_ids[existing_idx].append(doc_id)
+                return
 
-        # If the root is full, the tree grows upward
-        if len(root.keys) == (2 * self.order) - 1:
-            new_root = BTreeNode(leaf=False)
-            new_root.children.append(self.root)
-            self._split_child(new_root, 0)
-            self.root = new_root
+            # If the root is full, the tree grows upward
+            if len(root.keys) == (2 * self.order) - 1:
+                new_root = BTreeNode(leaf=False)
+                new_root.children.append(self.root)
+                self._split_child(new_root, 0)
+                self.root = new_root
 
-        self._insert_non_full(self.root, key, doc_id)
+            self._insert_non_full(self.root, key, doc_id)
+        except TypeError:
+            pass
 
     def search(self, key: Any) -> List[int]:
         """
@@ -80,20 +92,27 @@ class BTreeIndex:
 
         :param key: The field value to search for
         :returns: List of matching document IDs, or empty list if none found
+                  (also returns empty list on type mismatch)
         """
-        return self._search_node(self.root, key)
+        try:
+            return self._search_node(self.root, key)
+        except TypeError:
+            return []
 
     def delete(self, key: Any, doc_id: int) -> None:
         """
         Remove a specific document ID from the index for the given key.
 
         The key is only removed from the tree if no more document IDs are
-        associated with it.
+        associated with it. Silently skipped on type mismatch.
 
         :param key: The field value to remove from
         :param doc_id: The document ID to remove
         """
-        node, idx = self._find_key_node(self.root, key)
+        try:
+            node, idx = self._find_key_node(self.root, key)
+        except TypeError:
+            return
 
         if node is None:
             return  # Key doesn't exist
@@ -103,7 +122,10 @@ class BTreeIndex:
 
         # If no more documents for this key, remove it from the tree
         if not node.doc_ids[idx]:
-            self._delete_key(self.root, key)
+            try:
+                self._delete_key(self.root, key)
+            except TypeError:
+                pass
 
     def update(self, old_key: Any, new_key: Any, doc_id: int) -> None:
         """

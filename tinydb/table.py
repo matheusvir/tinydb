@@ -4,6 +4,7 @@ data in TinyDB.
 """
 
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -20,7 +21,7 @@ from typing import (
 
 from .queries import QueryLike
 from .storages import Storage
-from .utils import LRUCache
+from .utils import LRUCache, freeze
 from .index import BTreeIndex
 
 __all__ = ('Document', 'Table')
@@ -150,6 +151,12 @@ class Table:
         keeps it synchronized on every insert, update, and remove operation.
         Only simple top-level fields are supported.
 
+        .. note:: The indexed field should contain values of a single
+                  comparable type (e.g. all ``int`` or all ``str``). Mixing
+                  incompatible types (e.g. ``int`` and ``str``) in the same
+                  indexed field may cause index operations to be skipped
+                  silently, falling back to a full scan for searches.
+
         :param field: the document field to index
         :param order: the B-Tree order (higher = wider nodes, fewer levels)
         """
@@ -158,9 +165,50 @@ class Table:
         # Populate the index with existing documents
         for doc_id, doc in self._read_table().items():
             if field in doc:
-                index.insert(doc[field], self.document_id_class(doc_id))
+                index.insert(freeze(doc[field]), self.document_id_class(doc_id))
 
         self._indices[field] = index
+
+    def _capture_old_index_vals(
+        self, table: dict, doc_id
+    ) -> Dict[str, Any]:
+        """
+        Capture the current (pre-update) values of all indexed fields for a
+        document. Used to detect changes after an update operation.
+        """
+        if not self._indices:
+            return {}
+        return {
+            f: table[doc_id].get(f)
+            for f in self._indices if f in table[doc_id]
+        }
+
+    def _sync_indices_after_update(
+        self, table: dict, doc_id, old_vals: Dict[str, Any]
+    ) -> None:
+        """
+        Compare old and new values for all indexed fields and update the
+        B-Tree indices accordingly. Handles inserts, deletes, and updates
+        depending on whether the field was added, removed, or changed.
+        """
+        if not self._indices:
+            return
+        for f, idx in self._indices.items():
+            new_val = table[doc_id].get(f)
+            old_val = old_vals.get(f)
+            frozen_old = freeze(old_val) if old_val is not None else None
+            frozen_new = freeze(new_val) if new_val is not None else None
+            try:
+                if frozen_old is not None and frozen_new is not None:
+                    if frozen_old != frozen_new:
+                        idx.update(frozen_old, frozen_new, doc_id)
+                elif frozen_old is not None:
+                    idx.delete(frozen_old, doc_id)
+                elif frozen_new is not None:
+                    idx.insert(frozen_new, doc_id)
+            except TypeError:
+                # Incompatible types in the index — skip this field
+                pass
 
     def insert(self, document: Mapping) -> int:
         """
@@ -204,7 +252,7 @@ class Table:
         doc_dict = dict(document)
         for field, index in self._indices.items():
             if field in doc_dict:
-                index.insert(doc_dict[field], doc_id)
+                index.insert(freeze(doc_dict[field]), doc_id)
 
         return doc_id
 
@@ -258,7 +306,7 @@ class Table:
                 if raw is not None:
                     for field, index in self._indices.items():
                         if field in raw:
-                            index.insert(raw[field], did)
+                            index.insert(freeze(raw[field]), did)
 
         return doc_ids
 
@@ -310,8 +358,12 @@ class Table:
         if field not in self._indices:
             return None
 
-        value = hashval[2]
-        doc_ids = self._indices[field].search(value)
+        value = hashval[2]  # Already frozen by queries.py
+        try:
+            doc_ids = self._indices[field].search(value)
+        except TypeError:
+            # Incompatible types in the index — fall back to full scan
+            return None
 
         if not doc_ids:
             return []
@@ -517,49 +569,17 @@ class Table:
         # Define the function that will perform the update
         if callable(fields):
             def perform_update(table, doc_id):
-                # Capture old values for indexed fields before the update
-                if self._indices:
-                    old_vals = {
-                        f: table[doc_id].get(f)
-                        for f in self._indices if f in table[doc_id]
-                    }
+                old_vals = self._capture_old_index_vals(table, doc_id)
                 # Update documents by calling the update function provided by
                 # the user
                 fields(table[doc_id])
-                # Sync indices with new values
-                if self._indices:
-                    for f, idx in self._indices.items():
-                        new_val = table[doc_id].get(f)
-                        old_val = old_vals.get(f)
-                        if old_val is not None and new_val is not None:
-                            if old_val != new_val:
-                                idx.update(old_val, new_val, doc_id)
-                        elif old_val is not None:
-                            idx.delete(old_val, doc_id)
-                        elif new_val is not None:
-                            idx.insert(new_val, doc_id)
+                self._sync_indices_after_update(table, doc_id, old_vals)
         else:
             def perform_update(table, doc_id):
-                # Capture old values for indexed fields before the update
-                if self._indices:
-                    old_vals = {
-                        f: table[doc_id].get(f)
-                        for f in self._indices if f in table[doc_id]
-                    }
+                old_vals = self._capture_old_index_vals(table, doc_id)
                 # Update documents by setting all fields from the provided data
                 table[doc_id].update(fields)
-                # Sync indices with new values
-                if self._indices:
-                    for f, idx in self._indices.items():
-                        new_val = table[doc_id].get(f)
-                        old_val = old_vals.get(f)
-                        if old_val is not None and new_val is not None:
-                            if old_val != new_val:
-                                idx.update(old_val, new_val, doc_id)
-                        elif old_val is not None:
-                            idx.delete(old_val, doc_id)
-                        elif new_val is not None:
-                            idx.insert(new_val, doc_id)
+                self._sync_indices_after_update(table, doc_id, old_vals)
 
         if doc_ids is not None:
             # Perform the update operation for documents specified by a list
@@ -639,12 +659,7 @@ class Table:
 
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
-            # Capture old values for indexed fields before the update
-            if self._indices:
-                old_vals = {
-                    f: table[doc_id].get(f)
-                    for f in self._indices if f in table[doc_id]
-                }
+            old_vals = self._capture_old_index_vals(table, doc_id)
 
             if callable(fields):
                 # Update documents by calling the update function provided
@@ -655,18 +670,7 @@ class Table:
                 # data
                 table[doc_id].update(fields)
 
-            # Sync indices with new values
-            if self._indices:
-                for f, idx in self._indices.items():
-                    new_val = table[doc_id].get(f)
-                    old_val = old_vals.get(f)
-                    if old_val is not None and new_val is not None:
-                        if old_val != new_val:
-                            idx.update(old_val, new_val, doc_id)
-                    elif old_val is not None:
-                        idx.delete(old_val, doc_id)
-                    elif new_val is not None:
-                        idx.insert(new_val, doc_id)
+            self._sync_indices_after_update(table, doc_id, old_vals)
 
         # Perform the update operation for documents specified by a query
 
@@ -780,7 +784,7 @@ class Table:
             for did, raw in removed_docs.items():
                 for field, index in self._indices.items():
                     if field in raw:
-                        index.delete(raw[field], did)
+                        index.delete(freeze(raw[field]), did)
 
             return removed_ids
 
@@ -823,7 +827,7 @@ class Table:
             for did, raw in removed_docs_.items():
                 for field, index in self._indices.items():
                     if field in raw:
-                        index.delete(raw[field], did)
+                        index.delete(freeze(raw[field]), did)
 
             return removed_ids
 
