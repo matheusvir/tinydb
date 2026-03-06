@@ -1,21 +1,5 @@
 """
 Contains the :class:`BTreeIndex` for optimized field lookups.
-
-TinyDB's default behavior is to perform a linear scan (O(n)) for every
-search operation. This module provides a B-Tree implementation that
-improves search complexity to O(log n) without adding any external
-dependencies.
-
-Key features:
-    - Supports duplicate keys by storing a list of document IDs for each key.
-    - In-memory index that stays synchronized with TinyDB's storage.
-    - Supports any comparable Python type (str, int, float, etc.).
-
-.. note:: All values in a given indexed field should be of the same
-          comparable type. Mixing incompatible types (e.g. ``int`` and
-          ``str``) in the same field will cause ``TypeError`` on ``<``/``>``
-          comparisons. The public API methods handle this gracefully by
-          returning empty results or skipping the operation.
 """
 
 from typing import Any, List, Optional, Tuple
@@ -58,10 +42,8 @@ class BTreeIndex:
         Insert a document ID into the index under the given key.
 
         If the key already exists (another document has the same field value),
-        the ``doc_id`` is appended to the existing list.
-
-        If the key has an incompatible type with existing keys, the operation
-        is silently skipped.
+        the ``doc_id`` is appended to the existing list. If the key has an
+        incompatible type with existing keys, the operation is skipped.
 
         :param key: The field value to index
         :param doc_id: The document ID to associate with the key
@@ -91,8 +73,7 @@ class BTreeIndex:
         Return all document IDs that match the given key value.
 
         :param key: The field value to search for
-        :returns: List of matching document IDs, or empty list if none found
-                  (also returns empty list on type mismatch)
+        :returns: list of matching document IDs, or empty list if none found
         """
         try:
             return self._search_node(self.root, key)
@@ -104,7 +85,7 @@ class BTreeIndex:
         Remove a specific document ID from the index for the given key.
 
         The key is only removed from the tree if no more document IDs are
-        associated with it. Silently skipped on type mismatch.
+        associated with it.
 
         :param key: The field value to remove from
         :param doc_id: The document ID to remove

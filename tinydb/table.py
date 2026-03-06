@@ -149,13 +149,9 @@ class Table:
 
         This builds the index by scanning all existing documents and then
         keeps it synchronized on every insert, update, and remove operation.
-        Only simple top-level fields are supported.
-
-        .. note:: The indexed field should contain values of a single
-                  comparable type (e.g. all ``int`` or all ``str``). Mixing
-                  incompatible types (e.g. ``int`` and ``str``) in the same
-                  indexed field may cause index operations to be skipped
-                  silently, falling back to a full scan for searches.
+        Only simple top-level fields are supported. The indexed field should
+        contain values of a single comparable type (e.g. all ``int`` or all
+        ``str``).
 
         :param field: the document field to index
         :param order: the B-Tree order (higher = wider nodes, fewer levels)
@@ -335,10 +331,10 @@ class Table:
         Returns ``None`` if the index cannot be used for this query,
         signalling that the caller should fall back to a full scan.
 
-        .. note:: This optimization relies on the ``_hash`` property of the
-                  query object to identify equality comparisons. Custom query
-                  objects that do not provide a compatible ``_hash`` tuple
-                  will not benefit from index-based lookups.
+        This optimization relies on the ``_hash`` property of the query
+        object to identify equality comparisons. Custom query objects that
+        do not provide a compatible ``_hash`` tuple will not benefit from
+        index-based lookups.
         """
         # The hash of an equality query looks like:
         #   ('==', (field_name,), frozen_value)
