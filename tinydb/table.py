@@ -444,15 +444,18 @@ class Table:
         """
         if doc_id is not None:
             # Fast path: use the Bloom Filter to discard nonexistent IDs.
-            # If the filter isn't initialized yet, we fall through to get()
-            # which calls _read_table() and initializes the filter.
+            # If the filter isn't initialized yet, we fall through to
+            # _read_table() which initializes the filter.
             if (self._bloom is not None
                     and self._bloom_initialized
                     and not self._bloom.test(str(doc_id))):
                 return False
 
-            # Documents specified by ID
-            return self.get(doc_id=doc_id) is not None
+            # Instead of delegating to get(doc_id=...) — which would
+            # redundantly check the Bloom Filter a second time — we
+            # perform the lookup directly against the table data.
+            table = self._read_table()
+            return str(doc_id) in table
 
         elif cond is not None:
             # Document specified by condition
@@ -666,22 +669,37 @@ class Table:
             # to return the list of affected document IDs
             removed_ids = list(doc_ids)
 
+            # Capture the remaining keys after removal so the Bloom Filter
+            # can be rebuilt inside the updater — avoiding a second
+            # storage read that _rebuild_bloom_filter() would cause.
+            remaining_keys: List[str] = []
+
             def updater(table: dict):
                 for doc_id in removed_ids:
                     table.pop(doc_id)
 
+                # Collect the surviving keys while the table data is still
+                # available in memory.
+                remaining_keys.extend(str(k) for k in table.keys())
+
             # Perform the remove operation
             self._update_table(updater)
 
-            # Rebuild the Bloom Filter since standard filters don't support
-            # element deletion
+            # Rebuild the Bloom Filter from the keys we already captured,
+            # with zero extra storage I/O.
             if self._bloom is not None:
-                self._rebuild_bloom_filter()
+                self._bloom.rebuild(remaining_keys)
+                self._bloom_initialized = True
 
             return removed_ids
 
         if cond is not None:
             removed_ids = []
+
+            # Capture the remaining keys after removal so the Bloom Filter
+            # can be rebuilt inside the updater — avoiding a second
+            # storage read that _rebuild_bloom_filter() would cause.
+            remaining_keys: List[str] = []
 
             # This updater function will be called with the table data
             # as its first argument. See ``Table._update`` for details on this
@@ -705,13 +723,18 @@ class Table:
                         # Remove document from the table
                         table.pop(doc_id)
 
+                # Collect the surviving keys while the table data is still
+                # available in memory.
+                remaining_keys.extend(str(k) for k in table.keys())
+
             # Perform the remove operation
             self._update_table(updater)
 
-            # Rebuild the Bloom Filter since standard filters don't support
-            # element deletion
+            # Rebuild the Bloom Filter from the keys we already captured,
+            # with zero extra storage I/O.
             if self._bloom is not None:
-                self._rebuild_bloom_filter()
+                self._bloom.rebuild(remaining_keys)
+                self._bloom_initialized = True
 
             return removed_ids
 

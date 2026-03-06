@@ -21,6 +21,7 @@ False
 
 import hashlib
 import math
+import warnings
 from typing import Any, Dict, Iterable, List
 
 __all__ = ('BloomFilter',)
@@ -126,6 +127,20 @@ class BloomFilter:
             self._bit_array[byte_idx] |= (1 << bit_idx)
 
         self._count += 1
+
+        # Warn once when the number of items exceeds the configured
+        # capacity.  Beyond this point the false positive rate degrades
+        # significantly (e.g. ~73% at 5x, ~99% at 10x).
+        if self._count == self._expected_items + 1:
+            warnings.warn(
+                f'BloomFilter: item count ({self._count}) exceeded '
+                f'expected_items ({self._expected_items}). '
+                f'The false positive rate will be significantly higher '
+                f'than the configured {self._fp_rate:.2%}. '
+                f'Consider recreating the table with a larger '
+                f'bloom_expected_items value.',
+                stacklevel=2,
+            )
 
     def test(self, item: Any) -> bool:
         """
