@@ -4,6 +4,7 @@ data in TinyDB.
 """
 
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -21,7 +22,8 @@ from typing import (
 from .bloom_filter import BloomFilter
 from .queries import QueryLike
 from .storages import Storage
-from .utils import LRUCache
+from .utils import LRUCache, freeze
+from .index import BTreeIndex
 
 __all__ = ('Document', 'Table')
 
@@ -118,6 +120,7 @@ class Table:
             = self.query_cache_class(capacity=cache_size)
 
         self._next_id = None
+        self._indices: Dict[str, BTreeIndex] = {}
 
         # Initialize the Bloom Filter for fast negative lookups on doc_ids.
         # The filter is built lazily on first access to avoid an extra
@@ -158,6 +161,69 @@ class Table:
         """
         return self._storage
 
+    def create_index(self, field: str, order: int = 50) -> None:
+        """
+        Create a B-Tree index for the given field.
+
+        This builds the index by scanning all existing documents and then
+        keeps it synchronized on every insert, update, and remove operation.
+        Only simple top-level fields are supported. The indexed field should
+        contain values of a single comparable type (e.g. all ``int`` or all
+        ``str``).
+
+        :param field: the document field to index
+        :param order: the B-Tree order (higher = wider nodes, fewer levels)
+        """
+        index = BTreeIndex(order=order)
+
+        # Populate the index with existing documents
+        for doc_id, doc in self._read_table().items():
+            if field in doc:
+                index.insert(freeze(doc[field]), self.document_id_class(doc_id))
+
+        self._indices[field] = index
+
+    def _capture_old_index_vals(
+        self, table: dict, doc_id
+    ) -> Dict[str, Any]:
+        """
+        Capture the current (pre-update) values of all indexed fields for a
+        document. Used to detect changes after an update operation.
+        """
+        if not self._indices:
+            return {}
+        return {
+            f: table[doc_id].get(f)
+            for f in self._indices if f in table[doc_id]
+        }
+
+    def _sync_indices_after_update(
+        self, table: dict, doc_id, old_vals: Dict[str, Any]
+    ) -> None:
+        """
+        Compare old and new values for all indexed fields and update the
+        B-Tree indices accordingly. Handles inserts, deletes, and updates
+        depending on whether the field was added, removed, or changed.
+        """
+        if not self._indices:
+            return
+        for f, idx in self._indices.items():
+            new_val = table[doc_id].get(f)
+            old_val = old_vals.get(f)
+            frozen_old = freeze(old_val) if old_val is not None else None
+            frozen_new = freeze(new_val) if new_val is not None else None
+            try:
+                if frozen_old is not None and frozen_new is not None:
+                    if frozen_old != frozen_new:
+                        idx.update(frozen_old, frozen_new, doc_id)
+                elif frozen_old is not None:
+                    idx.delete(frozen_old, doc_id)
+                elif frozen_new is not None:
+                    idx.insert(frozen_new, doc_id)
+            except TypeError:
+                # Incompatible types in the index — skip this field
+                pass
+
     def insert(self, document: Mapping) -> int:
         """
         Insert a new document into the table.
@@ -195,6 +261,12 @@ class Table:
 
         # See below for details on ``Table._update``
         self._update_table(updater)
+
+        # Update all indices with the new document
+        doc_dict = dict(document)
+        for field, index in self._indices.items():
+            if field in doc_dict:
+                index.insert(freeze(doc_dict[field]), doc_id)
 
         # Update the Bloom Filter with the new document ID.
         # If the filter hasn't been initialized yet, the next _read_table()
@@ -246,6 +318,16 @@ class Table:
         # See below for details on ``Table._update``
         self._update_table(updater)
 
+        # Update all indices with the newly inserted documents
+        if self._indices:
+            table_data = self._read_table()
+            for did in doc_ids:
+                raw = table_data.get(str(did))
+                if raw is not None:
+                    for field, index in self._indices.items():
+                        if field in raw:
+                            index.insert(freeze(raw[field]), did)
+
         # Update the Bloom Filter with all new document IDs.
         # See insert() for why we check _bloom_initialized.
         if self._bloom is not None and self._bloom_initialized:
@@ -268,6 +350,58 @@ class Table:
 
         return list(iter(self))
 
+    def _try_index_search(
+        self, cond: QueryLike
+    ) -> Optional[List[Document]]:
+        """
+        Attempt to resolve a query using a B-Tree index.
+
+        Returns a list of matching documents if the query is a simple
+        equality check (``Query().field == value``) on an indexed field.
+        Returns ``None`` if the index cannot be used for this query,
+        signalling that the caller should fall back to a full scan.
+
+        This optimization relies on the ``_hash`` property of the query
+        object to identify equality comparisons. Custom query objects that
+        do not provide a compatible ``_hash`` tuple will not benefit from
+        index-based lookups.
+        """
+        # The hash of an equality query looks like:
+        #   ('==', (field_name,), frozen_value)
+        hashval = getattr(cond, '_hash', None)
+        if not (isinstance(hashval, tuple)
+                and len(hashval) == 3
+                and hashval[0] == '=='):
+            return None
+
+        path = hashval[1]
+        # Only single-level field paths are indexable
+        if not (isinstance(path, tuple) and len(path) == 1
+                and isinstance(path[0], str)):
+            return None
+
+        field = path[0]
+        if field not in self._indices:
+            return None
+
+        value = hashval[2]  # Already frozen by queries.py
+        try:
+            doc_ids = self._indices[field].search(value)
+        except TypeError:
+            # Incompatible types in the index — fall back to full scan
+            return None
+
+        if not doc_ids:
+            return []
+
+        # Fetch the matching documents from storage
+        table = self._read_table()
+        return [
+            self.document_class(table[str(did)], self.document_id_class(did))
+            for did in doc_ids
+            if str(did) in table
+        ]
+
     def search(self, cond: QueryLike) -> List[Document]:
         """
         Search for all documents matching a 'where' cond.
@@ -282,14 +416,19 @@ class Table:
         if cached_results is not None:
             return cached_results[:]
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
-            if cond(doc)
-        ]
+        # Try to use a B-Tree index for O(log n) lookup
+        indexed_result = self._try_index_search(cond)
+        if indexed_result is not None:
+            docs = indexed_result
+        else:
+            # Fallback: full scan — apply the query to all documents.
+            # Then, only if the document matches the query, convert it
+            # to the document class and document ID class.
+            docs = [
+                self.document_class(doc, self.document_id_class(doc_id))
+                for doc_id, doc in self._read_table().items()
+                if cond(doc)
+            ]
 
         # Only cache cacheable queries.
         #
@@ -482,13 +621,17 @@ class Table:
         # Define the function that will perform the update
         if callable(fields):
             def perform_update(table, doc_id):
+                old_vals = self._capture_old_index_vals(table, doc_id)
                 # Update documents by calling the update function provided by
                 # the user
                 fields(table[doc_id])
+                self._sync_indices_after_update(table, doc_id, old_vals)
         else:
             def perform_update(table, doc_id):
+                old_vals = self._capture_old_index_vals(table, doc_id)
                 # Update documents by setting all fields from the provided data
                 table[doc_id].update(fields)
+                self._sync_indices_after_update(table, doc_id, old_vals)
 
         if doc_ids is not None:
             # Perform the update operation for documents specified by a list
@@ -568,6 +711,8 @@ class Table:
 
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
+            old_vals = self._capture_old_index_vals(table, doc_id)
+
             if callable(fields):
                 # Update documents by calling the update function provided
                 # by the user
@@ -576,6 +721,8 @@ class Table:
                 # Update documents by setting all fields from the provided
                 # data
                 table[doc_id].update(fields)
+
+            self._sync_indices_after_update(table, doc_id, old_vals)
 
         # Perform the update operation for documents specified by a query
 
@@ -669,6 +816,15 @@ class Table:
             # to return the list of affected document IDs
             removed_ids = list(doc_ids)
 
+            # Capture indexed values before removal
+            removed_docs: Dict[int, Mapping] = {}
+            if self._indices:
+                table_snapshot = self._read_table()
+                for did in removed_ids:
+                    raw = table_snapshot.get(str(did))
+                    if raw is not None:
+                        removed_docs[did] = raw
+
             # Capture the remaining keys after removal so the Bloom Filter
             # can be rebuilt inside the updater — avoiding a second
             # storage read that _rebuild_bloom_filter() would cause.
@@ -685,6 +841,12 @@ class Table:
             # Perform the remove operation
             self._update_table(updater)
 
+            # Update indices
+            for did, raw in removed_docs.items():
+                for field, index in self._indices.items():
+                    if field in raw:
+                        index.delete(freeze(raw[field]), did)
+
             # Rebuild the Bloom Filter from the keys we already captured,
             # with zero extra storage I/O.
             if self._bloom is not None:
@@ -695,6 +857,9 @@ class Table:
 
         if cond is not None:
             removed_ids = []
+
+            # Capture indexed values before removal
+            removed_docs_: Dict[int, Mapping] = {}
 
             # Capture the remaining keys after removal so the Bloom Filter
             # can be rebuilt inside the updater — avoiding a second
@@ -720,6 +885,10 @@ class Table:
                         # Add document ID to list of removed document IDs
                         removed_ids.append(doc_id)
 
+                        # Capture document for index cleanup
+                        if self._indices:
+                            removed_docs_[doc_id] = dict(table[doc_id])
+
                         # Remove document from the table
                         table.pop(doc_id)
 
@@ -729,6 +898,12 @@ class Table:
 
             # Perform the remove operation
             self._update_table(updater)
+
+            # Update indices
+            for did, raw in removed_docs_.items():
+                for field, index in self._indices.items():
+                    if field in raw:
+                        index.delete(freeze(raw[field]), did)
 
             # Rebuild the Bloom Filter from the keys we already captured,
             # with zero extra storage I/O.
@@ -750,6 +925,10 @@ class Table:
 
         # Reset document ID counter
         self._next_id = None
+
+        # Clear all indices
+        for index in self._indices.values():
+            index.clear()
 
         # Clear the Bloom Filter
         if self._bloom is not None:
