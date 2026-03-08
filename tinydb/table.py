@@ -19,6 +19,7 @@ from typing import (
     overload
 )
 
+from .bloom_filter import BloomFilter
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache, freeze
@@ -104,7 +105,10 @@ class Table:
         storage: Storage,
         name: str,
         cache_size: int = default_query_cache_capacity,
-        persist_empty: bool = False
+        persist_empty: bool = False,
+        bloom_filter: bool = True,
+        bloom_expected_items: int = 10_000,
+        bloom_fp_rate: float = 0.01,
     ):
         """
         Create a table instance.
@@ -117,6 +121,20 @@ class Table:
 
         self._next_id = None
         self._indices: Dict[str, BTreeIndex] = {}
+
+        # Initialize the Bloom Filter for fast negative lookups on doc_ids.
+        # The filter is built lazily on first access to avoid an extra
+        # storage read during table construction.
+        self._use_bloom = bloom_filter
+        self._bloom_initialized = False
+        if self._use_bloom:
+            self._bloom: Optional[BloomFilter] = BloomFilter(
+                expected_items=bloom_expected_items,
+                false_positive_rate=bloom_fp_rate,
+            )
+        else:
+            self._bloom = None
+
         if persist_empty:
             self._update_table(lambda table: table.clear())
 
@@ -250,6 +268,12 @@ class Table:
             if field in doc_dict:
                 index.insert(freeze(doc_dict[field]), doc_id)
 
+        # Update the Bloom Filter with the new document ID.
+        # If the filter hasn't been initialized yet, the next _read_table()
+        # call will rebuild it from storage (which already includes this ID).
+        if self._bloom is not None and self._bloom_initialized:
+            self._bloom.add(str(doc_id))
+
         return doc_id
 
     def insert_multiple(self, documents: Iterable[Mapping]) -> List[int]:
@@ -303,6 +327,12 @@ class Table:
                     for field, index in self._indices.items():
                         if field in raw:
                             index.insert(freeze(raw[field]), did)
+
+        # Update the Bloom Filter with all new document IDs.
+        # See insert() for why we check _bloom_initialized.
+        if self._bloom is not None and self._bloom_initialized:
+            for doc_id in doc_ids:
+                self._bloom.add(str(doc_id))
 
         return doc_ids
 
@@ -478,9 +508,22 @@ class Table:
 
         :returns: the document(s) or ``None``
         """
-        table = self._read_table()
 
         if doc_id is not None:
+            # Fast path: use the Bloom Filter to discard nonexistent IDs
+            # *before* any storage I/O.  When the filter is already
+            # initialized (i.e. after the first _read_table() call) this
+            # avoids the overhead of reading and parsing the storage file
+            # for IDs that are definitely absent.
+            if (self._bloom is not None
+                    and self._bloom_initialized
+                    and not self._bloom.test(str(doc_id))):
+                return None
+
+            # The ID might exist (or the filter is not yet initialised).
+            # We need the actual table data from storage.
+            table = self._read_table()
+
             # Retrieve a document specified by its ID
             raw_doc = table.get(str(doc_id), None)
 
@@ -491,6 +534,8 @@ class Table:
             return self.document_class(raw_doc, doc_id)
 
         elif doc_ids is not None:
+            table = self._read_table()
+
             # Filter the table by extracting out all those documents which
             # have doc id specified in the doc_id list.
 
@@ -537,8 +582,19 @@ class Table:
         :param doc_id: the document ID to look for
         """
         if doc_id is not None:
-            # Documents specified by ID
-            return self.get(doc_id=doc_id) is not None
+            # Fast path: use the Bloom Filter to discard nonexistent IDs.
+            # If the filter isn't initialized yet, we fall through to
+            # _read_table() which initializes the filter.
+            if (self._bloom is not None
+                    and self._bloom_initialized
+                    and not self._bloom.test(str(doc_id))):
+                return False
+
+            # Instead of delegating to get(doc_id=...) — which would
+            # redundantly check the Bloom Filter a second time — we
+            # perform the lookup directly against the table data.
+            table = self._read_table()
+            return str(doc_id) in table
 
         elif cond is not None:
             # Document specified by condition
@@ -769,9 +825,18 @@ class Table:
                     if raw is not None:
                         removed_docs[did] = raw
 
+            # Capture the remaining keys after removal so the Bloom Filter
+            # can be rebuilt inside the updater — avoiding a second
+            # storage read that _rebuild_bloom_filter() would cause.
+            remaining_keys: List[str] = []
+
             def updater(table: dict):
                 for doc_id in removed_ids:
                     table.pop(doc_id)
+
+                # Collect the surviving keys while the table data is still
+                # available in memory.
+                remaining_keys.extend(str(k) for k in table.keys())
 
             # Perform the remove operation
             self._update_table(updater)
@@ -782,6 +847,12 @@ class Table:
                     if field in raw:
                         index.delete(freeze(raw[field]), did)
 
+            # Rebuild the Bloom Filter from the keys we already captured,
+            # with zero extra storage I/O.
+            if self._bloom is not None:
+                self._bloom.rebuild(remaining_keys)
+                self._bloom_initialized = True
+
             return removed_ids
 
         if cond is not None:
@@ -789,6 +860,11 @@ class Table:
 
             # Capture indexed values before removal
             removed_docs_: Dict[int, Mapping] = {}
+
+            # Capture the remaining keys after removal so the Bloom Filter
+            # can be rebuilt inside the updater — avoiding a second
+            # storage read that _rebuild_bloom_filter() would cause.
+            remaining_keys: List[str] = []
 
             # This updater function will be called with the table data
             # as its first argument. See ``Table._update`` for details on this
@@ -816,6 +892,10 @@ class Table:
                         # Remove document from the table
                         table.pop(doc_id)
 
+                # Collect the surviving keys while the table data is still
+                # available in memory.
+                remaining_keys.extend(str(k) for k in table.keys())
+
             # Perform the remove operation
             self._update_table(updater)
 
@@ -824,6 +904,12 @@ class Table:
                 for field, index in self._indices.items():
                     if field in raw:
                         index.delete(freeze(raw[field]), did)
+
+            # Rebuild the Bloom Filter from the keys we already captured,
+            # with zero extra storage I/O.
+            if self._bloom is not None:
+                self._bloom.rebuild(remaining_keys)
+                self._bloom_initialized = True
 
             return removed_ids
 
@@ -843,6 +929,10 @@ class Table:
         # Clear all indices
         for index in self._indices.values():
             index.clear()
+
+        # Clear the Bloom Filter
+        if self._bloom is not None:
+            self._bloom.rebuild([])
 
     def count(self, cond: QueryLike) -> int:
         """
@@ -937,6 +1027,12 @@ class Table:
             # The table does not exist yet, so it is empty
             return {}
 
+        # Lazily initialize the Bloom Filter from the data we just read,
+        # piggybacking on this storage read with zero extra I/O cost.
+        if self._bloom is not None and not self._bloom_initialized:
+            self._bloom.rebuild(table.keys())
+            self._bloom_initialized = True
+
         return table
 
     def _update_table(self, updater: Callable[[Dict[int, Mapping]], None]):
@@ -990,3 +1086,16 @@ class Table:
 
         # Clear the query cache, as the table contents have changed
         self.clear_cache()
+
+    def _rebuild_bloom_filter(self) -> None:
+        """
+        Rebuild the Bloom Filter from the current table contents.
+
+        This is called after operations that may invalidate the filter
+        (e.g. remove, truncate) since standard Bloom Filters do not support
+        element deletion.
+        """
+        if self._bloom is not None:
+            table = self._read_table()
+            self._bloom.rebuild(table.keys())
+            self._bloom_initialized = True
